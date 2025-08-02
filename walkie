@@ -1,0 +1,172 @@
+#include "RadioLib.h"
+#include "pin_config.h"
+#include "Arduino_DriveBus_Library.h"
+#include "codec2.h"
+
+#define IIS_SAMPLE_RATE 8000 // Sample rate (Hz)
+#define IIS_DATA_BIT 16      // Bits per sample
+
+#define LORA_TRANSMISSION_HEAD_SIZE 12
+#define LORA_TRANSMISSION_DATA_SIZE 200
+
+const uint64_t Local_MAC = ESP.getEfuseMac();
+
+std::vector<short> IIS_Read_Data_Stream;
+std::vector<short> IIS_Write_Data_Stream;
+std::vector<unsigned char> Lora_Send_Data_Stream;
+std::vector<unsigned char> Lora_Receive_Data_Stream;
+
+bool Lora_Transmission_Mode = 0; // Default to receive mode
+
+uint8_t Send_Package[LORA_TRANSMISSION_HEAD_SIZE + LORA_TRANSMISSION_DATA_SIZE] = {
+    'M',
+    'A',
+    'C',
+    ':',
+    (uint8_t)(Local_MAC >> 56),
+    (uint8_t)(Local_MAC >> 48),
+    (uint8_t)(Local_MAC >> 40),
+    (uint8_t)(Local_MAC >> 32),
+    (uint8_t)(Local_MAC >> 24),
+    (uint8_t)(Local_MAC >> 16),
+    (uint8_t)(Local_MAC >> 8),
+    (uint8_t)Local_MAC,
+};
+
+uint8_t Receive_Package[LORA_TRANSMISSION_HEAD_SIZE + LORA_TRANSMISSION_DATA_SIZE];
+
+// Flag indicating a packet was sent or received
+volatile bool Radio_Operation_Flag = false;
+
+// Flag for boot key press
+volatile bool Boot_Key_Flag = false;
+
+#if defined T3_S3_MVSRBoard_V1_0
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
+#elif defined T3_S3_MVSRBoard_V1_1
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_0, -1, MP34DT05TR_LRCLK, MP34DT05TR_DATA);
+#else
+#error "Unknown macro definition. Please select the correct macro definition."
+#endif
+
+std::unique_ptr<Arduino_IIS> IIS(new Arduino_MEMS(IIS_Bus));
+
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus_1 =
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_1, MAX98357A_BCLK, MAX98357A_LRCLK,
+                                    MAX98357A_DATA);
+
+std::unique_ptr<Arduino_IIS> MAX98357A(new Arduino_Amplifier(IIS_Bus_1));
+
+SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
+
+void Radio_Interrupt(void)
+{
+    // Transmit or receive operation finished; set the flag
+    Radio_Operation_Flag = true;
+}
+
+/**
+ * @brief  Convert stereo (interleaved) to mono by extracting one channel.
+ * @param  input_data         Pointer to interleaved stereo PCM samples.
+ * @param  output_data        Output vector for mono samples.
+ * @param  input_data_size    Number of input samples (int16_t units).
+ * @param  extract_channel    false -> left channel, true -> right channel.
+ * @return true on success, false on invalid input.
+ */
+bool IIS_Mono_Conversion(const int16_t *input_data, std::vector<int16_t> *output_data,
+                         size_t input_data_size, bool extract_channel)
+{
+    if (input_data == nullptr || input_data_size < 1)
+    {
+        log_w("The input data is incorrect.");
+        return false;
+    }
+
+    if ((input_data_size % 2) != 0)
+    {
+        log_w("Input sample count is odd; one sample will be dropped.");
+        input_data_size--;
+    }
+
+    output_data->clear();
+
+    if (!extract_channel) // extract left channel
+    {
+        for (size_t i = 0; i < input_data_size; i += 2)
+        {
+            output_data->push_back(input_data[i]);
+        }
+    }
+    else // extract right channel
+    {
+        for (size_t i = 0; i < input_data_size; i += 2)
+        {
+            output_data->push_back(input_data[i + 1]);
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief  Duplicate mono samples to stereo with optional gain.
+ * @param  input_data         Pointer to mono PCM samples.
+ * @param  output_data        Output vector for interleaved stereo samples.
+ * @param  input_data_size    Number of input samples (int16_t units).
+ * @param  decibel_multiplier Linear gain multiplier (1.0 = unity).
+ * @return true on success, false on invalid input.
+ */
+bool IIS_Dual_Conversion(const int16_t *input_data, std::vector<int16_t> *output_data,
+                         size_t input_data_size, float decibel_multiplier = 1.0)
+{
+    if (input_data == nullptr || input_data_size == 0)
+    {
+        log_w("The input data is incorrect.");
+        return false;
+    }
+
+    output_data->clear();
+
+    for (size_t i = 0; i < input_data_size; i++)
+    {
+        const short s = static_cast<short>((float)input_data[i] * decibel_multiplier);
+        // Interleave L, R with the same sample
+        output_data->push_back(s);
+        output_data->push_back(s);
+    }
+
+    return true;
+}
+
+/**
+ * @brief  In-place operations on interleaved stereo samples.
+ * @param  input_data         Pointer to interleaved stereo PCM samples.
+ * @param  input_data_size    Number of input samples (int16_t units).
+ * @param  operation_mode     1: copy R->L, 2: copy L->R, 3: clear L, 4: clear R.
+ * @return true on success, false on invalid input.
+ */
+bool IIS_Channel_Operation(int16_t *input_data, size_t input_data_size, size_t operation_mode)
+{
+    if (input_data == nullptr || input_data_size < 1)
+    {
+        log_w("The input data is incorrect.");
+        return false;
+    }
+
+    if ((input_data_size % 2) != 0)
+    {
+        log_w("Input sample count is odd; one sample will be dropped.");
+        input_data_size--;
+    }
+
+    switch (operation_mode)
+    {
+    case 1: // copy right channel into left
+        for (size_t i = 0; i < input_data_size; i++)
+        {
+            input_data[2 * i] = input_data[2 * i + 1];
+        }
+        break;
+    case 2: // copy left channe
