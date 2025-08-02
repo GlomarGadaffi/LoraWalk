@@ -1,46 +1,106 @@
+// === Voice-over-LoRa (SX1262 900 MHz) – ESP32-S3 ===
+// Hardware: ESP32-S3FH4R2, MAX98357A, MSM261S4030HOR, SX1262 (868/915MHz)
+// Build: Arduino-ESP32 core w/ FreeRTOS; requires esp_heap_caps.h
+
 #include "RadioLib.h"
 #include "pin_config.h"
 #include "Arduino_DriveBus_Library.h"
 #include "codec2.h"
+#include <vector>
+#include <cstring>
+#include <atomic>
 
-#define IIS_SAMPLE_RATE 8000 // Sample rate (Hz)
-#define IIS_DATA_BIT 16      // Bits per sample
+extern "C" {
+  #include "esp_heap_caps.h"
+}
 
-#define LORA_TRANSMISSION_HEAD_SIZE 12
-#define LORA_TRANSMISSION_DATA_SIZE 200
+#define IIS_SAMPLE_RATE   8000   // Hz
+#define IIS_DATA_BIT      16     // bits per sample
 
+// LoRa payload sizes
+#define LORA_TRANSMISSION_HEAD_SIZE  12
+#define LORA_TRANSMISSION_DATA_SIZE  200   // bytes per packet payload (after header)
+
+// Codec / audio ring buffer capacities (tune as needed)
+#define COMP_RING_CAP_BYTES   (8 * 1024)     // compressed TX/RX ring (PSRAM)
+#define PCM_RING_CAP_SAMPLES  (16 * 1024)    // interleaved int16_t stereo (internal RAM)
+
+// Playback chunk to feed MAX98357A (bytes)
+#define PLAY_CHUNK_BYTES (size_t(320) * sizeof(int16_t))
+
+// Task stacks
+#define STACK_CODEC2   32768
+#define STACK_PLAY     30720
+
+// Core pinning
+#define AUDIO_TASK_CORE   1   // pin audio tasks to Core 1
+
+// --- Globals & Flags ---
 const uint64_t Local_MAC = ESP.getEfuseMac();
 
-std::vector<short> IIS_Read_Data_Stream;
-std::vector<short> IIS_Write_Data_Stream;
-std::vector<unsigned char> Lora_Send_Data_Stream;
-std::vector<unsigned char> Lora_Receive_Data_Stream;
+volatile bool Radio_Operation_Flag = false;  // set in DIO1 ISR
+volatile bool Boot_Key_Flag = false;
 
-bool Lora_Transmission_Mode = 0; // Default to receive mode
+bool Lora_Transmission_Mode = false; // false=RX, true=TX
 
+// Header template "MAC:" + 8-byte MAC
 uint8_t Send_Package[LORA_TRANSMISSION_HEAD_SIZE + LORA_TRANSMISSION_DATA_SIZE] = {
-    'M',
-    'A',
-    'C',
-    ':',
-    (uint8_t)(Local_MAC >> 56),
-    (uint8_t)(Local_MAC >> 48),
-    (uint8_t)(Local_MAC >> 40),
-    (uint8_t)(Local_MAC >> 32),
-    (uint8_t)(Local_MAC >> 24),
-    (uint8_t)(Local_MAC >> 16),
-    (uint8_t)(Local_MAC >> 8),
-    (uint8_t)Local_MAC,
+  'M','A','C',':',
+  (uint8_t)(Local_MAC >> 56),(uint8_t)(Local_MAC >> 48),(uint8_t)(Local_MAC >> 40),(uint8_t)(Local_MAC >> 32),
+  (uint8_t)(Local_MAC >> 24),(uint8_t)(Local_MAC >> 16),(uint8_t)(Local_MAC >> 8),(uint8_t)(Local_MAC)
 };
 
 uint8_t Receive_Package[LORA_TRANSMISSION_HEAD_SIZE + LORA_TRANSMISSION_DATA_SIZE];
 
-// Flag indicating a packet was sent or received
-volatile bool Radio_Operation_Flag = false;
+// --- Simple lock-free single-producer/single-consumer ring buffer ---
+template<typename T>
+struct RingBuffer {
+  T* buf = nullptr;
+  size_t cap = 0;                // number of elements (NOT bytes)
+  volatile size_t head = 0;      // write index
+  volatile size_t tail = 0;      // read index
 
-// Flag for boot key press
-volatile bool Boot_Key_Flag = false;
+  bool init(size_t n, uint32_t caps) {
+    buf = (T*)heap_caps_malloc(n * sizeof(T), caps);
+    if(!buf) return false;
+    cap = n;
+    head = tail = 0;
+    return true;
+  }
+  inline size_t available() const { // elements available to read
+    size_t h = head, t = tail;
+    return (h + cap - t) % cap;
+  }
+  inline size_t free_space() const { // elements free to write
+    return (cap - 1) - available();
+  }
+  size_t write(const T* src, size_t n) { // returns elements written
+    size_t w = 0;
+    while (w < n && free_space() > 0) {
+      buf[head] = src[w++];
+      head = (head + 1) % cap;
+    }
+    return w;
+  }
+  size_t read(T* dst, size_t n) { // returns elements read
+    size_t r = 0;
+    while (r < n && available() > 0) {
+      dst[r++] = buf[tail];
+      tail = (tail + 1) % cap;
+    }
+    return r;
+  }
+  void clear() { head = tail = 0; }
+};
 
+// Compressed (bytes) TX/RX rings in PSRAM
+RingBuffer<uint8_t> rb_tx_comp;
+RingBuffer<uint8_t> rb_rx_comp;
+
+// PCM stereo ring (int16_t) in INTERNAL RAM for low-latency playback
+RingBuffer<int16_t> rb_pcm_out;
+
+// I2S buses
 #if defined T3_S3_MVSRBoard_V1_0
 std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
     std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
@@ -54,119 +114,302 @@ std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
 std::unique_ptr<Arduino_IIS> IIS(new Arduino_MEMS(IIS_Bus));
 
 std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus_1 =
-    std::make_shared<Arduino_HWIIS>(I2S_NUM_1, MAX98357A_BCLK, MAX98357A_LRCLK,
-                                    MAX98357A_DATA);
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_1, MAX98357A_BCLK, MAX98357A_LRCLK, MAX98357A_DATA);
 
 std::unique_ptr<Arduino_IIS> MAX98357A(new Arduino_Amplifier(IIS_Bus_1));
 
+// SX1262 (LoRa @ 868/915 MHz)
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
 
-void Radio_Interrupt(void)
-{
-    // Transmit or receive operation finished; set the flag
-    Radio_Operation_Flag = true;
+// --- ISR for DIO1 ---
+void IRAM_ATTR Radio_Interrupt(void) {
+  Radio_Operation_Flag = true;
+}
+
+// --- Utilities ---
+/**
+ * Convert interleaved stereo -> mono (choose L or R).
+ */
+bool IIS_Mono_Conversion(const int16_t* in, std::vector<int16_t>* out, size_t in_samples, bool right_channel) {
+  if (!in || in_samples < 2) return false;
+  if (in_samples & 1) in_samples--; // drop odd sample
+  out->clear();
+  out->reserve(in_samples / 2);
+  if (!right_channel) {
+    for (size_t i = 0; i < in_samples; i += 2) out->push_back(in[i]);
+  } else {
+    for (size_t i = 0; i < in_samples; i += 2) out->push_back(in[i+1]);
+  }
+  return true;
 }
 
 /**
- * @brief  Convert stereo (interleaved) to mono by extracting one channel.
- * @param  input_data         Pointer to interleaved stereo PCM samples.
- * @param  output_data        Output vector for mono samples.
- * @param  input_data_size    Number of input samples (int16_t units).
- * @param  extract_channel    false -> left channel, true -> right channel.
- * @return true on success, false on invalid input.
+ * Duplicate mono -> stereo with gain (clamped).
  */
-bool IIS_Mono_Conversion(const int16_t *input_data, std::vector<int16_t> *output_data,
-                         size_t input_data_size, bool extract_channel)
-{
-    if (input_data == nullptr || input_data_size < 1)
-    {
-        log_w("The input data is incorrect.");
-        return false;
-    }
-
-    if ((input_data_size % 2) != 0)
-    {
-        log_w("Input sample count is odd; one sample will be dropped.");
-        input_data_size--;
-    }
-
-    output_data->clear();
-
-    if (!extract_channel) // extract left channel
-    {
-        for (size_t i = 0; i < input_data_size; i += 2)
-        {
-            output_data->push_back(input_data[i]);
-        }
-    }
-    else // extract right channel
-    {
-        for (size_t i = 0; i < input_data_size; i += 2)
-        {
-            output_data->push_back(input_data[i + 1]);
-        }
-    }
-
-    return true;
+static inline int16_t clamp16(int32_t v) {
+  if (v > 32767) return 32767;
+  if (v < -32768) return -32768;
+  return (int16_t)v;
+}
+bool IIS_Dual_Conversion(const int16_t* in, std::vector<int16_t>* out, size_t in_samples, float gain = 1.0f) {
+  if (!in || in_samples == 0) return false;
+  out->clear();
+  out->reserve(in_samples * 2);
+  for (size_t i = 0; i < in_samples; i++) {
+    int16_t s = clamp16((int32_t)((float)in[i] * gain));
+    out->push_back(s); // L
+    out->push_back(s); // R
+  }
+  return true;
 }
 
 /**
- * @brief  Duplicate mono samples to stereo with optional gain.
- * @param  input_data         Pointer to mono PCM samples.
- * @param  output_data        Output vector for interleaved stereo samples.
- * @param  input_data_size    Number of input samples (int16_t units).
- * @param  decibel_multiplier Linear gain multiplier (1.0 = unity).
- * @return true on success, false on invalid input.
+ * In-place operations on interleaved stereo.
+ * operation_mode: 1 R->L, 2 L->R, 3 clear L, 4 clear R
  */
-bool IIS_Dual_Conversion(const int16_t *input_data, std::vector<int16_t> *output_data,
-                         size_t input_data_size, float decibel_multiplier = 1.0)
-{
-    if (input_data == nullptr || input_data_size == 0)
-    {
-        log_w("The input data is incorrect.");
-        return false;
-    }
-
-    output_data->clear();
-
-    for (size_t i = 0; i < input_data_size; i++)
-    {
-        const short s = static_cast<short>((float)input_data[i] * decibel_multiplier);
-        // Interleave L, R with the same sample
-        output_data->push_back(s);
-        output_data->push_back(s);
-    }
-
-    return true;
+bool IIS_Channel_Operation(int16_t* inout, size_t in_samples, size_t operation_mode) {
+  if (!inout || in_samples < 2) return false;
+  if (in_samples & 1) in_samples--;
+  const size_t frames = in_samples / 2;
+  switch (operation_mode) {
+    case 1: for (size_t i = 0; i < frames; i++) inout[2*i]   = inout[2*i+1]; break;
+    case 2: for (size_t i = 0; i < frames; i++) inout[2*i+1] = inout[2*i];   break;
+    case 3: for (size_t i = 0; i < frames; i++) inout[2*i]   = 0;            break;
+    case 4: for (size_t i = 0; i < frames; i++) inout[2*i+1] = 0;            break;
+    default: break;
+  }
+  return true;
 }
 
-/**
- * @brief  In-place operations on interleaved stereo samples.
- * @param  input_data         Pointer to interleaved stereo PCM samples.
- * @param  input_data_size    Number of input samples (int16_t units).
- * @param  operation_mode     1: copy R->L, 2: copy L->R, 3: clear L, 4: clear R.
- * @return true on success, false on invalid input.
- */
-bool IIS_Channel_Operation(int16_t *input_data, size_t input_data_size, size_t operation_mode)
-{
-    if (input_data == nullptr || input_data_size < 1)
-    {
-        log_w("The input data is incorrect.");
-        return false;
+// --- Tasks ---
+void Codec2_Task(void* parameter) {
+  // Codec2 init
+  struct CODEC2* c2 = codec2_create(CODEC2_MODE_3200);
+  if (!c2) {
+    Serial.println("Codec2 create failed");
+    vTaskDelete(nullptr);
+    return;
+  }
+  codec2_set_lpc_post_filter(c2, 1, 0, 0.8f, 0.2f);
+  const int c2_samples = codec2_samples_per_frame(c2);   // mono samples per frame
+  const int c2_bytes   = codec2_bytes_per_frame(c2);     // compressed bytes per frame
+
+  int16_t* mono_buf     = (int16_t*)heap_caps_malloc(sizeof(int16_t) * c2_samples, MALLOC_CAP_INTERNAL);
+  int16_t* decode_buf   = (int16_t*)heap_caps_malloc(sizeof(int16_t) * c2_samples, MALLOC_CAP_INTERNAL);
+  uint8_t* comp_buf     = (uint8_t*) heap_caps_malloc(c2_bytes, MALLOC_CAP_SPIRAM);
+  if (!mono_buf || !decode_buf || !comp_buf) {
+    Serial.println("Audio buffer alloc failed");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  Serial.printf("Codec2 ready: samples/frame=%d, bytes/frame=%d\n", c2_samples, c2_bytes);
+
+  // Capture loop
+  for (;;) {
+    // TX path: mic -> codec2 -> tx ring
+    if (Lora_Transmission_Mode) {
+      // Read enough mono samples for one Codec2 frame
+      const size_t mono_bytes_needed = sizeof(int16_t) * c2_samples;
+      if (IIS->IIS_Read_Data(mono_buf, mono_bytes_needed)) {
+        codec2_encode(c2, comp_buf, mono_buf);
+        // write compressed frame to TX ring
+        size_t wrote = rb_tx_comp.write(comp_buf, (size_t)c2_bytes);
+        (void)wrote; // if ring full, we drop (could count drops)
+      }
     }
 
-    if ((input_data_size % 2) != 0)
-    {
-        log_w("Input sample count is odd; one sample will be dropped.");
-        input_data_size--;
+    // RX path: rx ring -> decode -> stereo -> PCM ring
+    if (rb_rx_comp.available() >= (size_t)c2_bytes) {
+      uint8_t frame[256]; // c2_bytes max is small; 256 is safe headroom
+      size_t got = rb_rx_comp.read(frame, (size_t)c2_bytes);
+      if (got == (size_t)c2_bytes) {
+        codec2_decode(c2, decode_buf, frame);
+        // mono -> stereo with modest gain
+        std::vector<int16_t> stereo;
+        IIS_Dual_Conversion(decode_buf, &stereo, (size_t)c2_samples, 3.0f);
+        // push to PCM ring
+        (void)rb_pcm_out.write(stereo.data(), stereo.size());
+      }
     }
 
-    switch (operation_mode)
-    {
-    case 1: // copy right channel into left
-        for (size_t i = 0; i < input_data_size; i++)
-        {
-            input_data[2 * i] = input_data[2 * i + 1];
+    // Yield lightly; audio loop is realtime
+    taskYIELD();
+  }
+}
+
+void MAX_Play_Task(void* parameter) {
+  // Feed MAX98357A with fixed-size chunks from PCM ring
+  std::vector<int16_t> chunk;
+  chunk.resize(PLAY_CHUNK_BYTES / sizeof(int16_t));
+
+  for (;;) {
+    if (rb_pcm_out.available() >= chunk.size()) {
+      // read interleaved stereo samples
+      size_t got = rb_pcm_out.read(chunk.data(), chunk.size());
+      if (got == chunk.size()) {
+        (void)MAX98357A->IIS_Write_Data(chunk.data(), PLAY_CHUNK_BYTES);
+      }
+    } else {
+      // not enough data; small sleep to avoid busy spin
+      vTaskDelay(1);
+    }
+  }
+}
+
+// --- Radio receive/transmit helpers ---
+static inline void radio_start_rx() {
+  radio.startReceive();
+}
+
+static inline void radio_send_packet(const uint8_t* payload, size_t len) {
+  // blocking transmit; upon return, radio is idle
+  radio.transmit(payload, len);
+}
+
+// --- Setup / Loop ---
+void setup() {
+  Serial.begin(115200);
+
+  // Boot button
+  pinMode(0, INPUT_PULLUP);
+  attachInterrupt(
+    BOOT_KEY,
+    []() { Boot_Key_Flag = true; },
+    FALLING
+  );
+
+  // MAX98357A enable
+  pinMode(MAX98357A_SD_MODE, OUTPUT);
+  digitalWrite(MAX98357A_SD_MODE, HIGH);
+
+  // Mic enable + I2S init
+#if defined T3_S3_MVSRBoard_V1_0
+  pinMode(MSM261_EN, OUTPUT);
+  digitalWrite(MSM261_EN, HIGH);
+  while (!IIS->begin(i2s_mode_t::I2S_MODE_MASTER, ad_iis_data_mode_t::AD_IIS_DATA_IN,
+                     i2s_channel_fmt_t::I2S_CHANNEL_FMT_ONLY_RIGHT,
+                     IIS_DATA_BIT, IIS_SAMPLE_RATE)) {
+    Serial.println("MSM261 init failed"); delay(2000);
+  }
+  Serial.println("MSM261 OK");
+#elif defined T3_S3_MVSRBoard_V1_1
+  pinMode(MP34DT05TR_EN, OUTPUT);
+  digitalWrite(MP34DT05TR_EN, LOW);
+  while (!IIS->begin(i2s_mode_t::I2S_MODE_PDM, ad_iis_data_mode_t::AD_IIS_DATA_IN,
+                     i2s_channel_fmt_t::I2S_CHANNEL_FMT_ONLY_RIGHT,
+                     IIS_DATA_BIT, IIS_SAMPLE_RATE)) {
+    Serial.println("MP34DT05TR init failed"); delay(2000);
+  }
+  Serial.println("MP34DT05TR OK");
+#else
+#error "Unknown macro definition. Please select the correct macro definition."
+#endif
+
+  // Speaker (stereo out)
+  while (!MAX98357A->begin(i2s_mode_t::I2S_MODE_MASTER, ad_iis_data_mode_t::AD_IIS_DATA_OUT,
+                           i2s_channel_fmt_t::I2S_CHANNEL_FMT_RIGHT_LEFT,
+                           IIS_DATA_BIT, IIS_SAMPLE_RATE)) {
+    Serial.println("MAX98357A init failed"); delay(2000);
+  }
+  Serial.println("MAX98357A OK");
+
+  // SPI & Radio (LoRa mode)
+  Serial.println("[SX1262] Initializing LoRa …");
+  SPI.setFrequency(16000000);
+  SPI.begin(LORA_SCLK, LORA_MISO, LORA_MOSI);
+
+  int state = radio.begin(); // LoRa (NOT FSK)
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("Radio begin failed: %d\n", state);
+    while (true) delay(1000);
+  }
+
+  // Region: choose 914.6 MHz for US; adjust for your plan
+  radio.setFrequency(914.6);
+  radio.setBandwidth(500.0);        // kHz
+  radio.setSpreadingFactor(12);
+  radio.setCodingRate(8);           // 4/8
+  radio.setSyncWord(0xAB);
+  radio.setOutputPower(22);         // dBm (watch current draw)
+  radio.setCurrentLimit(140);
+  radio.setPreambleLength(16);
+  radio.setCRC(true);               // enable PHY CRC
+
+  // IRQ on DIO1
+  radio.setDio1Action(Radio_Interrupt);
+
+  // Init rings
+  bool ok =
+    rb_tx_comp.init(COMP_RING_CAP_BYTES, MALLOC_CAP_SPIRAM) &&
+    rb_rx_comp.init(COMP_RING_CAP_BYTES, MALLOC_CAP_SPIRAM) &&
+    rb_pcm_out.init(PCM_RING_CAP_SAMPLES, MALLOC_CAP_INTERNAL);
+  if (!ok) {
+    Serial.println("Ring buffer allocation failed");
+    while (true) delay(1000);
+  }
+
+  // Tasks pinned to Core 1 (audio)
+  xTaskCreatePinnedToCore(&Codec2_Task,  "Codec2_Task",  STACK_CODEC2, nullptr, 5, nullptr, AUDIO_TASK_CORE);
+  xTaskCreatePinnedToCore(&MAX_Play_Task,"MAX_Play_Task", STACK_PLAY,   nullptr, 5, nullptr, AUDIO_TASK_CORE);
+
+  radio_start_rx();
+  Serial.println("Setup complete");
+}
+
+static inline void clear_streams() {
+  rb_tx_comp.clear();
+  rb_rx_comp.clear();
+  rb_pcm_out.clear();
+}
+
+void loop() {
+  // Toggle TX/RX on boot key (simple debounce)
+  if (Boot_Key_Flag) {
+    delay(40);
+    if (digitalRead(BOOT_KEY) == LOW) {
+      Lora_Transmission_Mode = !Lora_Transmission_Mode;
+      if (!Lora_Transmission_Mode) {
+        radio_start_rx();
+      }
+      clear_streams();
+    }
+    Boot_Key_Flag = false;
+  }
+
+  // Build & send LoRa packet when we have enough compressed bytes
+  if (Lora_Transmission_Mode && rb_tx_comp.available() >= LORA_TRANSMISSION_DATA_SIZE) {
+    // fill payload body from TX ring
+    size_t got = rb_tx_comp.read(&Send_Package[LORA_TRANSMISSION_HEAD_SIZE], LORA_TRANSMISSION_DATA_SIZE);
+    if (got == LORA_TRANSMISSION_DATA_SIZE) {
+      radio_send_packet(Send_Package, sizeof(Send_Package));
+    }
+  }
+
+  // Handle radio IRQ events: read packet and queue to RX ring
+  if (Radio_Operation_Flag) {
+    Radio_Operation_Flag = false;
+
+    if (radio.readData(Receive_Package, sizeof(Receive_Package)) == RADIOLIB_ERR_NONE) {
+      // Validate header
+      if (Receive_Package[0]=='M' && Receive_Package[1]=='A' && Receive_Package[2]=='C' && Receive_Package[3]==':') {
+        uint64_t rxmac = 0;
+        for (size_t i = 0; i < 8; ++i)
+          rxmac |= (uint64_t)Receive_Package[4+i] << (56 - 8*i);
+
+        if (rxmac != Local_MAC) {
+          Serial.printf("[SX1262] RX  RSSI=%.1f dBm  SNR=%.1f dB\n", radio.getRSSI(), radio.getSNR());
         }
-        break;
-    case 2: // copy left channe
+        // Append payload to RX ring regardless (self-echo could be useful if you enable it later)
+        (void)rb_rx_comp.write(&Receive_Package[LORA_TRANSMISSION_HEAD_SIZE], LORA_TRANSMISSION_DATA_SIZE);
+      }
+    }
+
+    // resume RX if we're in receive mode
+    if (!Lora_Transmission_Mode) {
+      radio_start_rx();
+    }
+  }
+
+  vTaskDelay(2);
+}
