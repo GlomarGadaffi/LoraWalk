@@ -1,415 +1,303 @@
-// === Voice-over-LoRa (SX1262 900 MHz) – ESP32-S3 ===
-// Hardware: ESP32-S3FH4R2, MAX98357A, MSM261S4030HOR, SX1262 (868/915MHz)
-// Build: Arduino-ESP32 core w/ FreeRTOS; requires esp_heap_caps.h
+/*
+ * @Description: Voice-over-FSK Walkie Talkie (Optimized)
+ * @Hardware: ESP32-S3 + SX1262 + MSM261 (Mic) + MAX98357A (Amp)
+ * @Protocol: FSK @ 19.2 kbps (High Speed/Low Latency)
+ * @Codec: Codec2 (Mode 3200)
+ */
 
+#include <Arduino.h>
+#include <vector>
 #include "RadioLib.h"
-#include "pin_config.h"
+#include "pin_config.h"             // Ensure this file exists with your pin defs
 #include "Arduino_DriveBus_Library.h"
 #include "codec2.h"
-#include <vector>
-#include <cstring>
-#include <atomic>
 
-extern "C" {
-  #include "esp_heap_caps.h"
-}
+// --- Audio Configuration ---
+#define IIS_SAMPLE_RATE 8000
+#define IIS_DATA_BIT    16
 
-#define IIS_SAMPLE_RATE   8000   // Hz
-#define IIS_DATA_BIT      16     // bits per sample
+// --- Radio Configuration ---
+// FSK is faster than LoRa. We use 19.2 kbps to easily handle the 3.2 kbps audio stream.
+#define FSK_FREQ        914.6  // MHz (US)
+#define FSK_BITRATE     19.2   // kbps
+#define FSK_FREQ_DEV    10.0   // kHz
+#define FSK_RX_BW       39.0   // kHz
+#define FSK_PWR         22     // dBm
+#define FSK_PREAMBLE    16     // bits
 
-// LoRa payload sizes
-#define LORA_TRANSMISSION_HEAD_SIZE  12
-#define LORA_TRANSMISSION_DATA_SIZE  200   // bytes per packet payload (after header)
+// Packet Sizing
+#define PACKET_HEADER_SIZE  12
+#define PACKET_PAYLOAD_SIZE 200  // Audio payload size
 
-// Codec / audio ring buffer capacities (tune as needed)
-#define COMP_RING_CAP_BYTES   (8 * 1024)     // compressed TX/RX ring (PSRAM)
-#define PCM_RING_CAP_SAMPLES  (16 * 1024)    // interleaved int16_t stereo (internal RAM)
-
-// Playback chunk to feed MAX98357A (bytes)
-#define PLAY_CHUNK_BYTES (size_t(320) * sizeof(int16_t))
-
-// Task stacks
-#define STACK_CODEC2   32768
-#define STACK_PLAY     30720
-
-// Core pinning
-#define AUDIO_TASK_CORE   1   // pin audio tasks to Core 1
-
-// --- Globals & Flags ---
+// --- Globals ---
 const uint64_t Local_MAC = ESP.getEfuseMac();
+volatile bool Radio_Operation_Flag = false; // ISR Flag
+volatile bool Boot_Key_Flag = false;        // Button Flag
+bool Transmission_Mode = false;             // false = RX (Listen), true = TX (Talk)
 
-volatile bool Radio_Operation_Flag = false;  // set in DIO1 ISR
-volatile bool Boot_Key_Flag = false;
+// Audio Streams (Dynamic Buffers)
+std::vector<int16_t> IIS_Read_Stream;       // Mic -> Encoder
+std::vector<int16_t> IIS_Write_Stream;      // Decoder -> Speaker
+std::vector<uint8_t> Radio_Tx_Stream;       // Encoder -> Radio
+std::vector<uint8_t> Radio_Rx_Stream;       // Radio -> Decoder
 
-bool Lora_Transmission_Mode = false; // false=RX, true=TX
+// Packet Buffers
+uint8_t Send_Package[PACKET_HEADER_SIZE + PACKET_PAYLOAD_SIZE];
+uint8_t Receive_Package[PACKET_HEADER_SIZE + PACKET_PAYLOAD_SIZE];
 
-// Header template "MAC:" + 8-byte MAC
-uint8_t Send_Package[LORA_TRANSMISSION_HEAD_SIZE + LORA_TRANSMISSION_DATA_SIZE] = {
-  'M','A','C',':',
-  (uint8_t)(Local_MAC >> 56),(uint8_t)(Local_MAC >> 48),(uint8_t)(Local_MAC >> 40),(uint8_t)(Local_MAC >> 32),
-  (uint8_t)(Local_MAC >> 24),(uint8_t)(Local_MAC >> 16),(uint8_t)(Local_MAC >> 8),(uint8_t)(Local_MAC)
-};
-
-uint8_t Receive_Package[LORA_TRANSMISSION_HEAD_SIZE + LORA_TRANSMISSION_DATA_SIZE];
-
-// --- Simple lock-free single-producer/single-consumer ring buffer ---
-template<typename T>
-struct RingBuffer {
-  T* buf = nullptr;
-  size_t cap = 0;                // number of elements (NOT bytes)
-  volatile size_t head = 0;      // write index
-  volatile size_t tail = 0;      // read index
-
-  bool init(size_t n, uint32_t caps) {
-    buf = (T*)heap_caps_malloc(n * sizeof(T), caps);
-    if(!buf) return false;
-    cap = n;
-    head = tail = 0;
-    return true;
-  }
-  inline size_t available() const { // elements available to read
-    size_t h = head, t = tail;
-    return (h + cap - t) % cap;
-  }
-  inline size_t free_space() const { // elements free to write
-    return (cap - 1) - available();
-  }
-  size_t write(const T* src, size_t n) { // returns elements written
-    size_t w = 0;
-    while (w < n && free_space() > 0) {
-      buf[head] = src[w++];
-      head = (head + 1) % cap;
-    }
-    return w;
-  }
-  size_t read(T* dst, size_t n) { // returns elements read
-    size_t r = 0;
-    while (r < n && available() > 0) {
-      dst[r++] = buf[tail];
-      tail = (tail + 1) % cap;
-    }
-    return r;
-  }
-  void clear() { head = tail = 0; }
-};
-
-// Compressed (bytes) TX/RX rings in PSRAM
-RingBuffer<uint8_t> rb_tx_comp;
-RingBuffer<uint8_t> rb_rx_comp;
-
-// PCM stereo ring (int16_t) in INTERNAL RAM for low-latency playback
-RingBuffer<int16_t> rb_pcm_out;
-
-// I2S buses
+// --- Hardware Objects ---
 #if defined T3_S3_MVSRBoard_V1_0
-std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus_In =
     std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
 #elif defined T3_S3_MVSRBoard_V1_1
-std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus_In =
     std::make_shared<Arduino_HWIIS>(I2S_NUM_0, -1, MP34DT05TR_LRCLK, MP34DT05TR_DATA);
 #else
-#error "Unknown macro definition. Please select the correct macro definition."
+#error "Please select the correct board definition."
 #endif
 
-std::unique_ptr<Arduino_IIS> IIS(new Arduino_MEMS(IIS_Bus));
+std::unique_ptr<Arduino_IIS> IIS_Mic(new Arduino_MEMS(IIS_Bus_In));
 
-std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus_1 =
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus_Out =
     std::make_shared<Arduino_HWIIS>(I2S_NUM_1, MAX98357A_BCLK, MAX98357A_LRCLK, MAX98357A_DATA);
 
-std::unique_ptr<Arduino_IIS> MAX98357A(new Arduino_Amplifier(IIS_Bus_1));
+std::unique_ptr<Arduino_IIS> IIS_Speaker(new Arduino_Amplifier(IIS_Bus_Out));
 
-// SX1262 (LoRa @ 868/915 MHz)
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
 
-// --- ISR for DIO1 ---
+// --- Helper: Prepare Header ---
+void prepare_header() {
+    Send_Package[0] = 'M'; Send_Package[1] = 'A'; Send_Package[2] = 'C'; Send_Package[3] = ':';
+    for (int i = 0; i < 8; i++) {
+        Send_Package[4 + i] = (uint8_t)(Local_MAC >> (56 - (i * 8)));
+    }
+}
+
+// --- ISRs ---
 void IRAM_ATTR Radio_Interrupt(void) {
-  Radio_Operation_Flag = true;
+    Radio_Operation_Flag = true;
 }
 
-// --- Utilities ---
-/**
- * Convert interleaved stereo -> mono (choose L or R).
- */
-bool IIS_Mono_Conversion(const int16_t* in, std::vector<int16_t>* out, size_t in_samples, bool right_channel) {
-  if (!in || in_samples < 2) return false;
-  if (in_samples & 1) in_samples--; // drop odd sample
-  out->clear();
-  out->reserve(in_samples / 2);
-  if (!right_channel) {
-    for (size_t i = 0; i < in_samples; i += 2) out->push_back(in[i]);
-  } else {
-    for (size_t i = 0; i < in_samples; i += 2) out->push_back(in[i+1]);
-  }
-  return true;
+void IRAM_ATTR Button_Interrupt(void) {
+    Boot_Key_Flag = true;
 }
 
-/**
- * Duplicate mono -> stereo with gain (clamped).
- */
-static inline int16_t clamp16(int32_t v) {
-  if (v > 32767) return 32767;
-  if (v < -32768) return -32768;
-  return (int16_t)v;
-}
-bool IIS_Dual_Conversion(const int16_t* in, std::vector<int16_t>* out, size_t in_samples, float gain = 1.0f) {
-  if (!in || in_samples == 0) return false;
-  out->clear();
-  out->reserve(in_samples * 2);
-  for (size_t i = 0; i < in_samples; i++) {
-    int16_t s = clamp16((int32_t)((float)in[i] * gain));
-    out->push_back(s); // L
-    out->push_back(s); // R
-  }
-  return true;
-}
+// --- Task: Codec2 (Audio Engine) ---
+void Codec2_Task(void *parameter) {
+    struct CODEC2 *c2 = codec2_create(CODEC2_MODE_3200);
+    if (!c2) { Serial.println("Codec2 Init Failed"); vTaskDelete(NULL); }
+    
+    // Post-filter makes the voice sound less "robotic"
+    codec2_set_lpc_post_filter(c2, 1, 0, 0.8, 0.2);
 
-/**
- * In-place operations on interleaved stereo.
- * operation_mode: 1 R->L, 2 L->R, 3 clear L, 4 clear R
- */
-bool IIS_Channel_Operation(int16_t* inout, size_t in_samples, size_t operation_mode) {
-  if (!inout || in_samples < 2) return false;
-  if (in_samples & 1) in_samples--;
-  const size_t frames = in_samples / 2;
-  switch (operation_mode) {
-    case 1: for (size_t i = 0; i < frames; i++) inout[2*i]   = inout[2*i+1]; break;
-    case 2: for (size_t i = 0; i < frames; i++) inout[2*i+1] = inout[2*i];   break;
-    case 3: for (size_t i = 0; i < frames; i++) inout[2*i]   = 0;            break;
-    case 4: for (size_t i = 0; i < frames; i++) inout[2*i+1] = 0;            break;
-    default: break;
-  }
-  return true;
-}
+    const int n_samp = codec2_samples_per_frame(c2); // Samples per frame (160 for 3200 mode)
+    const int n_bytes = codec2_bytes_per_frame(c2);  // Bytes per compressed frame (40)
 
-// --- Tasks ---
-void Codec2_Task(void* parameter) {
-  // Codec2 init
-  struct CODEC2* c2 = codec2_create(CODEC2_MODE_3200);
-  if (!c2) {
-    Serial.println("Codec2 create failed");
-    vTaskDelete(nullptr);
-    return;
-  }
-  codec2_set_lpc_post_filter(c2, 1, 0, 0.8f, 0.2f);
-  const int c2_samples = codec2_samples_per_frame(c2);   // mono samples per frame
-  const int c2_bytes   = codec2_bytes_per_frame(c2);     // compressed bytes per frame
+    int16_t *sample_buf = (int16_t*)malloc(sizeof(int16_t) * n_samp);
+    int16_t *decode_buf = (int16_t*)malloc(sizeof(int16_t) * n_samp);
+    uint8_t *code_buf   = (uint8_t*)malloc(n_bytes);
 
-  int16_t* mono_buf     = (int16_t*)heap_caps_malloc(sizeof(int16_t) * c2_samples, MALLOC_CAP_INTERNAL);
-  int16_t* decode_buf   = (int16_t*)heap_caps_malloc(sizeof(int16_t) * c2_samples, MALLOC_CAP_INTERNAL);
-  uint8_t* comp_buf     = (uint8_t*) heap_caps_malloc(c2_bytes, MALLOC_CAP_SPIRAM);
-  if (!mono_buf || !decode_buf || !comp_buf) {
-    Serial.println("Audio buffer alloc failed");
-    vTaskDelete(nullptr);
-    return;
-  }
+    // How many frames fit in one radio packet? (200 bytes / 40 bytes = 5 frames)
+    const int frames_per_packet = PACKET_PAYLOAD_SIZE / n_bytes; 
 
-  Serial.printf("Codec2 ready: samples/frame=%d, bytes/frame=%d\n", c2_samples, c2_bytes);
+    Serial.printf("Audio Engine Started: %d samples/frame, %d bytes/frame\n", n_samp, n_bytes);
 
-  // Capture loop
-  for (;;) {
-    // TX path: mic -> codec2 -> tx ring
-    if (Lora_Transmission_Mode) {
-      // Read enough mono samples for one Codec2 frame
-      const size_t mono_bytes_needed = sizeof(int16_t) * c2_samples;
-      if (IIS->IIS_Read_Data(mono_buf, mono_bytes_needed)) {
-        codec2_encode(c2, comp_buf, mono_buf);
-        // write compressed frame to TX ring
-        size_t wrote = rb_tx_comp.write(comp_buf, (size_t)c2_bytes);
-        (void)wrote; // if ring full, we drop (could count drops)
-      }
-    }
-
-    // RX path: rx ring -> decode -> stereo -> PCM ring
-    if (rb_rx_comp.available() >= (size_t)c2_bytes) {
-      uint8_t frame[256]; // c2_bytes max is small; 256 is safe headroom
-      size_t got = rb_rx_comp.read(frame, (size_t)c2_bytes);
-      if (got == (size_t)c2_bytes) {
-        codec2_decode(c2, decode_buf, frame);
-        // mono -> stereo with modest gain
-        std::vector<int16_t> stereo;
-        IIS_Dual_Conversion(decode_buf, &stereo, (size_t)c2_samples, 3.0f);
-        // push to PCM ring
-        (void)rb_pcm_out.write(stereo.data(), stereo.size());
-      }
-    }
-
-    // Yield lightly; audio loop is realtime
-    taskYIELD();
-  }
-}
-
-void MAX_Play_Task(void* parameter) {
-  // Feed MAX98357A with fixed-size chunks from PCM ring
-  std::vector<int16_t> chunk;
-  chunk.resize(PLAY_CHUNK_BYTES / sizeof(int16_t));
-
-  for (;;) {
-    if (rb_pcm_out.available() >= chunk.size()) {
-      // read interleaved stereo samples
-      size_t got = rb_pcm_out.read(chunk.data(), chunk.size());
-      if (got == chunk.size()) {
-        (void)MAX98357A->IIS_Write_Data(chunk.data(), PLAY_CHUNK_BYTES);
-      }
-    } else {
-      // not enough data; small sleep to avoid busy spin
-      vTaskDelay(1);
-    }
-  }
-}
-
-// --- Radio receive/transmit helpers ---
-static inline void radio_start_rx() {
-  radio.startReceive();
-}
-
-static inline void radio_send_packet(const uint8_t* payload, size_t len) {
-  // blocking transmit; upon return, radio is idle
-  radio.transmit(payload, len);
-}
-
-// --- Setup / Loop ---
-void setup() {
-  Serial.begin(115200);
-
-  // Boot button
-  pinMode(0, INPUT_PULLUP);
-  attachInterrupt(
-    BOOT_KEY,
-    []() { Boot_Key_Flag = true; },
-    FALLING
-  );
-
-  // MAX98357A enable
-  pinMode(MAX98357A_SD_MODE, OUTPUT);
-  digitalWrite(MAX98357A_SD_MODE, HIGH);
-
-  // Mic enable + I2S init
-#if defined T3_S3_MVSRBoard_V1_0
-  pinMode(MSM261_EN, OUTPUT);
-  digitalWrite(MSM261_EN, HIGH);
-  while (!IIS->begin(i2s_mode_t::I2S_MODE_MASTER, ad_iis_data_mode_t::AD_IIS_DATA_IN,
-                     i2s_channel_fmt_t::I2S_CHANNEL_FMT_ONLY_RIGHT,
-                     IIS_DATA_BIT, IIS_SAMPLE_RATE)) {
-    Serial.println("MSM261 init failed"); delay(2000);
-  }
-  Serial.println("MSM261 OK");
-#elif defined T3_S3_MVSRBoard_V1_1
-  pinMode(MP34DT05TR_EN, OUTPUT);
-  digitalWrite(MP34DT05TR_EN, LOW);
-  while (!IIS->begin(i2s_mode_t::I2S_MODE_PDM, ad_iis_data_mode_t::AD_IIS_DATA_IN,
-                     i2s_channel_fmt_t::I2S_CHANNEL_FMT_ONLY_RIGHT,
-                     IIS_DATA_BIT, IIS_SAMPLE_RATE)) {
-    Serial.println("MP34DT05TR init failed"); delay(2000);
-  }
-  Serial.println("MP34DT05TR OK");
-#else
-#error "Unknown macro definition. Please select the correct macro definition."
-#endif
-
-  // Speaker (stereo out)
-  while (!MAX98357A->begin(i2s_mode_t::I2S_MODE_MASTER, ad_iis_data_mode_t::AD_IIS_DATA_OUT,
-                           i2s_channel_fmt_t::I2S_CHANNEL_FMT_RIGHT_LEFT,
-                           IIS_DATA_BIT, IIS_SAMPLE_RATE)) {
-    Serial.println("MAX98357A init failed"); delay(2000);
-  }
-  Serial.println("MAX98357A OK");
-
-  // SPI & Radio (LoRa mode)
-  Serial.println("[SX1262] Initializing LoRa …");
-  SPI.setFrequency(16000000);
-  SPI.begin(LORA_SCLK, LORA_MISO, LORA_MOSI);
-
-  int state = radio.begin(); // LoRa (NOT FSK)
-  if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("Radio begin failed: %d\n", state);
-    while (true) delay(1000);
-  }
-
-  // Region: choose 914.6 MHz for US; adjust for your plan
-  radio.setFrequency(914.6);
-  radio.setBandwidth(500.0);        // kHz
-  radio.setSpreadingFactor(12);
-  radio.setCodingRate(8);           // 4/8
-  radio.setSyncWord(0xAB);
-  radio.setOutputPower(22);         // dBm (watch current draw)
-  radio.setCurrentLimit(140);
-  radio.setPreambleLength(16);
-  radio.setCRC(true);               // enable PHY CRC
-
-  // IRQ on DIO1
-  radio.setDio1Action(Radio_Interrupt);
-
-  // Init rings
-  bool ok =
-    rb_tx_comp.init(COMP_RING_CAP_BYTES, MALLOC_CAP_SPIRAM) &&
-    rb_rx_comp.init(COMP_RING_CAP_BYTES, MALLOC_CAP_SPIRAM) &&
-    rb_pcm_out.init(PCM_RING_CAP_SAMPLES, MALLOC_CAP_INTERNAL);
-  if (!ok) {
-    Serial.println("Ring buffer allocation failed");
-    while (true) delay(1000);
-  }
-
-  // Tasks pinned to Core 1 (audio)
-  xTaskCreatePinnedToCore(&Codec2_Task,  "Codec2_Task",  STACK_CODEC2, nullptr, 5, nullptr, AUDIO_TASK_CORE);
-  xTaskCreatePinnedToCore(&MAX_Play_Task,"MAX_Play_Task", STACK_PLAY,   nullptr, 5, nullptr, AUDIO_TASK_CORE);
-
-  radio_start_rx();
-  Serial.println("Setup complete");
-}
-
-static inline void clear_streams() {
-  rb_tx_comp.clear();
-  rb_rx_comp.clear();
-  rb_pcm_out.clear();
-}
-
-void loop() {
-  // Toggle TX/RX on boot key (simple debounce)
-  if (Boot_Key_Flag) {
-    delay(40);
-    if (digitalRead(BOOT_KEY) == LOW) {
-      Lora_Transmission_Mode = !Lora_Transmission_Mode;
-      if (!Lora_Transmission_Mode) {
-        radio_start_rx();
-      }
-      clear_streams();
-    }
-    Boot_Key_Flag = false;
-  }
-
-  // Build & send LoRa packet when we have enough compressed bytes
-  if (Lora_Transmission_Mode && rb_tx_comp.available() >= LORA_TRANSMISSION_DATA_SIZE) {
-    // fill payload body from TX ring
-    size_t got = rb_tx_comp.read(&Send_Package[LORA_TRANSMISSION_HEAD_SIZE], LORA_TRANSMISSION_DATA_SIZE);
-    if (got == LORA_TRANSMISSION_DATA_SIZE) {
-      radio_send_packet(Send_Package, sizeof(Send_Package));
-    }
-  }
-
-  // Handle radio IRQ events: read packet and queue to RX ring
-  if (Radio_Operation_Flag) {
-    Radio_Operation_Flag = false;
-
-    if (radio.readData(Receive_Package, sizeof(Receive_Package)) == RADIOLIB_ERR_NONE) {
-      // Validate header
-      if (Receive_Package[0]=='M' && Receive_Package[1]=='A' && Receive_Package[2]=='C' && Receive_Package[3]==':') {
-        uint64_t rxmac = 0;
-        for (size_t i = 0; i < 8; ++i)
-          rxmac |= (uint64_t)Receive_Package[4+i] << (56 - 8*i);
-
-        if (rxmac != Local_MAC) {
-          Serial.printf("[SX1262] RX  RSSI=%.1f dBm  SNR=%.1f dB\n", radio.getRSSI(), radio.getSNR());
+    while (1) {
+        // --- TX: Microphone -> Codec2 -> Radio Stream ---
+        if (Transmission_Mode) {
+            // We need 5 frames to fill a packet
+            for (int f = 0; f < frames_per_packet; f++) {
+                // Read Mono Audio
+                if (IIS_Mic->IIS_Read_Data(sample_buf, n_samp * sizeof(int16_t))) {
+                    // Encode
+                    codec2_encode(c2, code_buf, sample_buf);
+                    
+                    // Push to Radio Stream
+                    size_t curr_size = Radio_Tx_Stream.size();
+                    Radio_Tx_Stream.resize(curr_size + n_bytes);
+                    memcpy(Radio_Tx_Stream.data() + curr_size, code_buf, n_bytes);
+                }
+            }
         }
-        // Append payload to RX ring regardless (self-echo could be useful if you enable it later)
-        (void)rb_rx_comp.write(&Receive_Package[LORA_TRANSMISSION_HEAD_SIZE], LORA_TRANSMISSION_DATA_SIZE);
-      }
+
+        // --- RX: Radio Stream -> Codec2 -> Speaker Stream ---
+        if (Radio_Rx_Stream.size() >= n_bytes) {
+            // Pop one frame from stream
+            memcpy(code_buf, Radio_Rx_Stream.data(), n_bytes);
+            Radio_Rx_Stream.erase(Radio_Rx_Stream.begin(), Radio_Rx_Stream.begin() + n_bytes);
+
+            // Decode
+            codec2_decode(c2, decode_buf, code_buf);
+
+            // Convert Mono -> Stereo (Duplicate channels) & Gain
+            std::vector<int16_t> stereo_out;
+            stereo_out.reserve(n_samp * 2);
+            for (int i = 0; i < n_samp; i++) {
+                int16_t val = decode_buf[i] * 5; // Gain x5
+                stereo_out.push_back(val);
+                stereo_out.push_back(val);
+            }
+
+            // Push to Speaker Stream
+            size_t curr_size = IIS_Write_Stream.size();
+            IIS_Write_Stream.resize(curr_size + stereo_out.size());
+            memcpy(IIS_Write_Stream.data() + curr_size, stereo_out.data(), stereo_out.size() * sizeof(int16_t));
+        }
+
+        vTaskDelay(1); // Yield
+    }
+}
+
+// --- Task: Speaker Playback ---
+void MAX_Play_Task(void *parameter) {
+    const size_t chunk_size = 320 * sizeof(int16_t); // Play in small chunks
+    int16_t play_buf[320];
+
+    while (1) {
+        if (IIS_Write_Stream.size() >= 320) {
+            // Copy from stream
+            memcpy(play_buf, IIS_Write_Stream.data(), chunk_size);
+            
+            // Remove from stream
+            IIS_Write_Stream.erase(IIS_Write_Stream.begin(), IIS_Write_Stream.begin() + 320);
+
+            // Write to I2S Hardware
+            IIS_Speaker->IIS_Write_Data(play_buf, chunk_size);
+        } else {
+            vTaskDelay(2); // Wait for data
+        }
+    }
+}
+
+// --- Main Setup ---
+void setup() {
+    Serial.begin(115200);
+    prepare_header();
+
+    // Button
+    pinMode(0, INPUT_PULLUP);
+    attachInterrupt(BOOT_KEY, Button_Interrupt, FALLING);
+
+    // Amp Enable
+    pinMode(MAX98357A_SD_MODE, OUTPUT);
+    digitalWrite(MAX98357A_SD_MODE, HIGH);
+
+    // Mic Init
+    #if defined T3_S3_MVSRBoard_V1_0
+        pinMode(MSM261_EN, OUTPUT); digitalWrite(MSM261_EN, HIGH);
+        IIS_Mic->begin(i2s_mode_t::I2S_MODE_MASTER, ad_iis_data_mode_t::AD_IIS_DATA_IN, i2s_channel_fmt_t::I2S_CHANNEL_FMT_ONLY_RIGHT, IIS_DATA_BIT, IIS_SAMPLE_RATE);
+    #elif defined T3_S3_MVSRBoard_V1_1
+        pinMode(MP34DT05TR_EN, OUTPUT); digitalWrite(MP34DT05TR_EN, LOW);
+        IIS_Mic->begin(i2s_mode_t::I2S_MODE_PDM, ad_iis_data_mode_t::AD_IIS_DATA_IN, i2s_channel_fmt_t::I2S_CHANNEL_FMT_ONLY_RIGHT, IIS_DATA_BIT, IIS_SAMPLE_RATE);
+    #endif
+
+    // Speaker Init
+    IIS_Speaker->begin(i2s_mode_t::I2S_MODE_MASTER, ad_iis_data_mode_t::AD_IIS_DATA_OUT, i2s_channel_fmt_t::I2S_CHANNEL_FMT_RIGHT_LEFT, IIS_DATA_BIT, IIS_SAMPLE_RATE);
+
+    // --- Radio Init (The Critical Part) ---
+    Serial.print("[SX1262] Initializing FSK ... ");
+    SPI.begin(LORA_SCLK, LORA_MISO, LORA_MOSI);
+    
+    // Start FSK: Freq, BitRate, FreqDev, RxBw, Power, Preamble, TCXO
+    int state = radio.beginFSK(FSK_FREQ, FSK_BITRATE, FSK_FREQ_DEV, FSK_RX_BW, FSK_PWR, FSK_PREAMBLE, 1.6);
+    
+    if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("Success!");
+    } else {
+        Serial.printf("Failed, code %d\n", state);
+        while (true);
     }
 
-    // resume RX if we're in receive mode
-    if (!Lora_Transmission_Mode) {
-      radio_start_rx();
-    }
-  }
+    // FSK Fine Tuning
+    uint8_t syncWord[] = {0x2D, 0xD4}; 
+    radio.setSyncWord(syncWord, 2);
+    radio.setCRC(2);            // 2-byte CRC to filter bad audio packets
+    radio.setWhitening(true);   // Whitening for DC balance
+    radio.setPacketMode(RADIOLIB_SX126X_GFSK_PACKET_VARIABLE);
+    radio.setDio1Action(Radio_Interrupt);
+    
+    // Create Tasks
+    xTaskCreatePinnedToCore(Codec2_Task, "AudioEngine", 32000, NULL, 5, NULL, 1); // Core 1
+    xTaskCreatePinnedToCore(MAX_Play_Task, "Player", 10000, NULL, 5, NULL, 1);    // Core 1
 
-  vTaskDelay(2);
+    // Start Listening
+    radio.startReceive();
+}
+
+// --- Main Loop ---
+void loop() {
+    
+    // 1. Handle Button (Mode Toggle)
+    if (Boot_Key_Flag) {
+        delay(200); // Debounce
+        Boot_Key_Flag = false;
+
+        Transmission_Mode = !Transmission_Mode;
+        
+        // Clear buffers on switch to avoid playing old audio
+        IIS_Read_Stream.clear();
+        IIS_Write_Stream.clear();
+        Radio_Tx_Stream.clear();
+        Radio_Rx_Stream.clear();
+
+        if (Transmission_Mode) {
+            Serial.println(">>> TALK MODE <<<");
+        } else {
+            Serial.println("<<< LISTEN MODE >>>");
+            radio.startReceive();
+        }
+    }
+
+    // 2. Handle Transmission (If in Talk Mode)
+    // If we have enough compressed data for a full packet, send it.
+    if (Transmission_Mode && Radio_Tx_Stream.size() >= PACKET_PAYLOAD_SIZE) {
+        
+        // Prepare Payload
+        memcpy(&Send_Package[PACKET_HEADER_SIZE], Radio_Tx_Stream.data(), PACKET_PAYLOAD_SIZE);
+        
+        // Remove from Stream
+        Radio_Tx_Stream.erase(Radio_Tx_Stream.begin(), Radio_Tx_Stream.begin() + PACKET_PAYLOAD_SIZE);
+
+        // Transmit (Blocking is okay here because FSK is fast)
+        radio.transmit(Send_Package, PACKET_HEADER_SIZE + PACKET_PAYLOAD_SIZE);
+        
+        // Note: RadioLib usually puts radio in Standby after TX.
+        // We don't need to startReceive() here because we are the talker.
+    }
+
+    // 3. Handle Interrupts (RX or TX Done)
+    if (Radio_Operation_Flag) {
+        Radio_Operation_Flag = false;
+
+        uint16_t flags = radio.getIRQFlags();
+
+        // Check for Valid Packet Reception
+        if ((flags & RADIOLIB_SX126X_IRQ_RX_DONE) && !(flags & RADIOLIB_SX126X_IRQ_CRC_ERR)) {
+            
+            int state = radio.readData(Receive_Package, PACKET_HEADER_SIZE + PACKET_PAYLOAD_SIZE);
+
+            if (state == RADIOLIB_ERR_NONE) {
+                // Verify Header (Magic Bytes)
+                if (Receive_Package[0] == 'M' && Receive_Package[1] == 'A' && Receive_Package[2] == 'C') {
+                    
+                    // Optional: Check MAC to ignore self (if needed)
+                    // ...
+
+                    // Push Payload to RX Stream for Decoding
+                    size_t curr_size = Radio_Rx_Stream.size();
+                    Radio_Rx_Stream.resize(curr_size + PACKET_PAYLOAD_SIZE);
+                    memcpy(Radio_Rx_Stream.data() + curr_size, &Receive_Package[PACKET_HEADER_SIZE], PACKET_PAYLOAD_SIZE);
+                    
+                    Serial.printf("RX: %d dBm\n", (int)radio.getRSSI());
+                }
+            }
+        }
+
+        // Always resume listening if we are not the talker
+        if (!Transmission_Mode) {
+            radio.startReceive();
+        }
+    }
+
+    vTaskDelay(2); // Keep watchdog happy
 }
