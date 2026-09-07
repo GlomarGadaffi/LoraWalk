@@ -163,6 +163,7 @@ static bool     long_press_done = false;
 static bool     In_Call = false;            // last CTRL_CALL_STATE from a gateway
 static unsigned long last_ctrl_ms = 0;
 static uint8_t  last_ctrl_type = 0;
+static uint8_t  last_ctrl_arg = 0;
 static volatile bool Speaker_Play_Now = false;  // beep: skip the jitter prefill
 
 // ---------------------------------------------------------------------------
@@ -342,8 +343,9 @@ static void send_ctrl(uint8_t type, uint8_t arg) {
 
 static void handle_ctrl(const uint8_t* pkt) {
     uint8_t type = pkt[3], arg = pkt[4];
-    if (type == last_ctrl_type && millis() - last_ctrl_ms < 1000) return;  // on-air repeats
+    if (type == last_ctrl_type && arg == last_ctrl_arg && millis() - last_ctrl_ms < 1000) return;  // on-air repeats
     last_ctrl_type = type;
+    last_ctrl_arg = arg;
     last_ctrl_ms = millis();
     switch (type) {
         case CTRL_CALL_STATE:
