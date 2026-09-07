@@ -19,6 +19,7 @@
 #include "pin_config.h"
 #include "Arduino_DriveBus_Library.h"
 #include "codec2.h"
+#include "heap_audit.h"
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -344,6 +345,7 @@ void setup() {
 
     radio.startReceive();
     Serial.printf("node 0x%04X  <<< LISTEN >>>\n", Local_Node_Id);
+    HEAP_AUDIT_ARM();   // everything after this point must be heap-free
 }
 
 // ---------------------------------------------------------------------------
@@ -390,9 +392,10 @@ void loop() {
                 radio.standby();
                 Serial.println(">>> TALK <<<");
             } else {
-                Serial.printf("<<< LISTEN >>>  rx=%lu lost=%lu dropped=%lu\n",
+                Serial.printf("<<< LISTEN >>>  rx=%lu lost=%lu dropped=%lu heap_allocs=%lu min_free=%lu\n",
                               (unsigned long)Rx_Packets, (unsigned long)Rx_Lost,
-                              (unsigned long)Rx_Dropped);
+                              (unsigned long)Rx_Dropped, (unsigned long)HEAP_AUDIT_COUNT(),
+                              (unsigned long)esp_get_minimum_free_heap_size());
                 Radio_Operation_Flag = false;
                 radio.startReceive();
             }

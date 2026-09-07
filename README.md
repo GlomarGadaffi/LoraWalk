@@ -90,3 +90,31 @@ licence downstream work.
 
 The sequence/PLC/jitter path in this revision has been compiled, not
 air-tested. Please open an issue with the serial counters if it misbehaves.
+
+## Heap use in the hot path: none
+
+Everything the talk/listen loop touches is allocated once at start-up and
+never again:
+
+- Ring buffers, codec scratch buffers and packet staging are `static`.
+- Codec2 3200 allocates its state and FFT tables in `codec2_create`. Its
+  encode/decode path uses fixed and variable-length *stack* arrays; the FFTs
+  are 512 and 128 points, so kiss_fft never enters its generic-radix or
+  temp-buffer branches, and the in-place FFT wrapper copies through a stack
+  buffer.
+- RadioLib's `transmit(uint8_t*, len)`, `getPacketLength()` and
+  `readData(uint8_t*, len)` write straight to the SX1262 buffer. Only the
+  `String` overloads, which this code never calls, allocate.
+- I2S reads and writes go to DMA buffers created in `begin()`.
+
+To verify rather than trust that, build the audit variant:
+
+```sh
+pio run -e t3s3_sx1262_heapaudit -t upload
+```
+
+It links with `--wrap=malloc,calloc,realloc` and starts counting at the end
+of `setup()`. Every return to listen prints
+`heap_allocs=<n> min_free=<bytes>`; `n` must stay 0 across talk/listen
+cycles. The wrapper catches C++ `new` and Codec2's `codec2_malloc` as well
+(checked in the linked ELF).
