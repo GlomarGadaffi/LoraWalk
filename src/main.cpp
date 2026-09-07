@@ -11,7 +11,8 @@
  * Lineage: started from LilyGo's SX126x_Walkie_Talkie example (GPL-3.0).
  *
  * Push-to-talk is a toggle on the BOOT button: press once to talk, press
- * again to listen.
+ * again to listen. Hold it for LONG_PRESS_MS to ask a tincan-autopatch
+ * gateway to place (or end) a phone call.
  */
 
 #include <Arduino.h>
@@ -43,6 +44,18 @@
 #define PACKET_HEADER_SIZE  4   // magic, node id (2), sequence
 #define PACKET_PAYLOAD_SIZE (FRAMES_PER_PACKET * C2_BYTES_PER_FRAME) // 40
 #define PACKET_SIZE         (PACKET_HEADER_SIZE + PACKET_PAYLOAD_SIZE) // 44
+
+// Control packets (tincan-autopatch gateway): magic, node id (2), type, arg
+#define PKT_MAGIC_CTRL      0xC3
+#define PKT_CTRL_SIZE       5
+#define PKT_CTRL_REPEAT     3
+enum CtrlType : uint8_t {
+    CTRL_CALL       = 1,   // walkie -> gateway: dial the preset extension
+    CTRL_HANGUP     = 2,   // walkie -> gateway: end the call
+    CTRL_CALL_STATE = 3,   // gateway -> walkie: arg 1 = in call, 0 = idle
+    CTRL_BEEP       = 4,   // gateway -> walkie: roger beep, phone side unkeyed
+};
+#define LONG_PRESS_MS       800
 
 // Receive-side buffering
 #define RX_QUEUE_PACKETS     8   // 800 ms of speech, bounded
@@ -144,6 +157,13 @@ static uint16_t Rx_Last_From = 0;
 static uint32_t Rx_Packets = 0, Rx_Lost = 0, Rx_Dropped = 0;
 
 static unsigned long last_button_ms = 0;
+static unsigned long press_start_ms = 0;
+static bool     button_down = false;
+static bool     long_press_done = false;
+static bool     In_Call = false;            // last CTRL_CALL_STATE from a gateway
+static unsigned long last_ctrl_ms = 0;
+static uint8_t  last_ctrl_type = 0;
+static volatile bool Speaker_Play_Now = false;  // beep: skip the jitter prefill
 
 // ---------------------------------------------------------------------------
 // Hardware objects
@@ -279,7 +299,7 @@ static void MAX_Play_Task(void*) {
     while (true) {
         size_t avail = Speaker_Ring.available();
         if (!playing) {
-            if (avail >= prefill) { playing = true; starved = 0; }
+            if (avail >= prefill || Speaker_Play_Now) { playing = true; starved = 0; Speaker_Play_Now = false; }
             else { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
         }
         if (Speaker_Ring.pop(play_buf, chunk)) {
@@ -290,6 +310,52 @@ static void MAX_Play_Task(void*) {
             IIS_Speaker->IIS_Write_Data(silence, sizeof(silence));
             if (++starved >= FRAMES_PER_PACKET * MAX_PLC_PACKETS) playing = false;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local tones (never go over the air) and control packets
+// ---------------------------------------------------------------------------
+static void queue_beep(float hz, int ms) {
+    static int16_t buf[C2_SAMPLES_PER_FRAME * 2];
+    static float phase = 0.0f;
+    const float step = 6.2831853f * hz / IIS_SAMPLE_RATE;
+    int frames = (ms + 19) / 20;
+    for (int f = 0; f < frames; f++) {
+        for (int i = 0; i < C2_SAMPLES_PER_FRAME; i++) {
+            int16_t v = (int16_t)(sinf(phase) * 6000.0f);
+            phase += step;
+            if (phase > 6.2831853f) phase -= 6.2831853f;
+            buf[i * 2] = buf[i * 2 + 1] = v;
+        }
+        Speaker_Ring.push(buf, C2_SAMPLES_PER_FRAME * 2);
+    }
+    Speaker_Play_Now = true;
+}
+
+static void send_ctrl(uint8_t type, uint8_t arg) {
+    uint8_t pkt[PKT_CTRL_SIZE] = { PKT_MAGIC_CTRL, (uint8_t)(Local_Node_Id & 0xFF),
+                                   (uint8_t)(Local_Node_Id >> 8), type, arg };
+    for (int i = 0; i < PKT_CTRL_REPEAT; i++) radio.transmit(pkt, sizeof(pkt));
+    if (!Transmission_Mode) radio.startReceive();
+}
+
+static void handle_ctrl(const uint8_t* pkt) {
+    uint8_t type = pkt[3], arg = pkt[4];
+    if (type == last_ctrl_type && millis() - last_ctrl_ms < 1000) return;  // on-air repeats
+    last_ctrl_type = type;
+    last_ctrl_ms = millis();
+    switch (type) {
+        case CTRL_CALL_STATE:
+            In_Call = (arg != 0);
+            Serial.printf("gateway: %s\n", In_Call ? "CALL CONNECTED" : "call idle");
+            queue_beep(In_Call ? 1200.0f : 600.0f, In_Call ? 200 : 120);
+            break;
+        case CTRL_BEEP:
+            queue_beep(1000.0f, 120);    // phone side unkeyed: your turn
+            break;
+        default:
+            break;
     }
 }
 
@@ -377,12 +443,33 @@ static void enqueue_rx(const uint8_t* pkt) {
 }
 
 void loop() {
-    // --- Debounced PTT toggle ---
+    // --- Button: short press toggles PTT, long press asks the gateway ---
+    bool toggle_ptt = false;
     if (Boot_Key_Flag) {
         Boot_Key_Flag = false;
         unsigned long now = millis();
-        if (now - last_button_ms >= DEBOUNCE_MS) {
+        if (!button_down && now - last_button_ms >= DEBOUNCE_MS) {
             last_button_ms = now;
+            button_down = true;
+            long_press_done = false;
+            press_start_ms = now;
+        }
+    }
+    if (button_down) {
+        bool held = digitalRead(BOOT_KEY) == LOW;
+        if (held && !long_press_done && millis() - press_start_ms >= LONG_PRESS_MS) {
+            long_press_done = true;
+            Serial.printf("long press: %s\n", In_Call ? "HANGUP" : "CALL");
+            send_ctrl(In_Call ? CTRL_HANGUP : CTRL_CALL, 0);
+            queue_beep(800.0f, 80);
+        }
+        if (!held) {
+            button_down = false;
+            if (!long_press_done) toggle_ptt = true;
+        }
+    }
+    if (toggle_ptt) {
+        {
             Transmission_Mode = !Transmission_Mode;
             Radio_Tx_Ring.clear();
             Radio_Rx_Queue.clear();
@@ -419,11 +506,13 @@ void loop() {
         uint32_t flags = radio.getIrqFlags();
         if ((flags & RADIOLIB_SX126X_IRQ_RX_DONE) && !(flags & RADIOLIB_SX126X_IRQ_CRC_ERR)) {
             size_t len = radio.getPacketLength();
-            if (len == PACKET_SIZE &&
-                radio.readData(Receive_Package, PACKET_SIZE) == RADIOLIB_ERR_NONE &&
-                Receive_Package[0] == PACKET_MAGIC) {
+            if ((len == PACKET_SIZE || len == PKT_CTRL_SIZE) &&
+                radio.readData(Receive_Package, len) == RADIOLIB_ERR_NONE) {
                 uint16_t from = Receive_Package[1] | (Receive_Package[2] << 8);
-                if (from != Local_Node_Id) enqueue_rx(Receive_Package);
+                if (from != Local_Node_Id) {
+                    if (len == PACKET_SIZE && Receive_Package[0] == PACKET_MAGIC) enqueue_rx(Receive_Package);
+                    else if (len == PKT_CTRL_SIZE && Receive_Package[0] == PKT_MAGIC_CTRL) handle_ctrl(Receive_Package);
+                }
             }
         }
         radio.startReceive();

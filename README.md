@@ -47,6 +47,17 @@ returns to prefill so the next burst starts with a fresh jitter margin.
 completely or not at all, so codec frame boundaries can never shift when a
 buffer fills. Every capacity is an exact multiple of what is pushed into it.
 
+## Phone patch
+
+With a [tincan-autopatch](https://github.com/GlomarGadaffi/tincan-autopatch)
+gateway on the channel, the walkie net reaches a pocket-dial phone system.
+**Hold BOOT for 0.8 s** to ask the gateway to dial its preset extension; hold
+again during the call to hang up. The gateway broadcasts call state, so the
+walkie double-beeps when the call connects and low-beeps when it ends, and
+sounds a 1 kHz roger beep whenever the phone side stops talking (your turn).
+Beeps are synthesised locally from 5-byte control packets (magic `0xC3`),
+never sent through Codec2. A short press still toggles push-to-talk.
+
 ## Building
 
 Requires [PlatformIO](https://platformio.org/). RadioLib and sh123's
