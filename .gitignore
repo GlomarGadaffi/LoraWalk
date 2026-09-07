@@ -6,3 +6,6 @@ notes/
 LINEAGE.md
 *.old
 *.bak
+lib/Arduino_DriveBus/
+.pio/
+.vscode/
