@@ -58,7 +58,35 @@ sounds a 1 kHz roger beep whenever the phone side stops talking (your turn).
 Beeps are synthesised locally from 5-byte control packets (magic `0xC3`),
 never sent through Codec2. A short press still toggles push-to-talk.
 
-## Building
+## Building (ESP-IDF, no Arduino)
+
+The primary build is plain ESP-IDF v6.0. RadioLib comes through the IDF
+component manager (declared by `components/fsk_link`), Codec2 is fetched, the
+MVSR mic/amp path is tincan's MIT `audio_io.c`. Nothing from LilyGo's GPL
+`Arduino_DriveBus` is involved.
+
+```sh
+./scripts/fetch_idf_deps.sh      # Codec2 sources into components/codec2/upstream (LGPL, not vendored)
+idf.py set-target esp32s3
+idf.py build flash monitor
+```
+
+Image is ~310 KB. `components/fsk_link` (SX1262 GFSK link with an ESP32-S3
+HAL for RadioLib, plus `fsk_proto.h`, the one definition of the wire format)
+and `components/codec2` are also consumed by
+[tincan-autopatch](https://github.com/GlomarGadaffi/tincan-autopatch) via
+`EXTRA_COMPONENT_DIRS`, the way tincan consumes tincan-core.
+
+Layout:
+
+```
+main/                 app_main.cpp (tasks + button), audio_io.c/.h + board_mvsr.h (from tincan), walkie_config.h
+components/fsk_link/  RadioLib on esp_driver_spi/gpio/esp_timer; C API; fsk_proto.h
+components/codec2/    CMake wrapper, mode 3200 only; upstream/ is fetched
+src/, platformio.ini  legacy Arduino build (below), kept until the IDF build is air-tested
+```
+
+## Building (legacy Arduino / PlatformIO)
 
 Requires [PlatformIO](https://platformio.org/). RadioLib and sh123's
 `esp32_codec2_arduino` are pulled automatically. LilyGo's `Arduino_DriveBus`
@@ -99,8 +127,9 @@ licence downstream work.
 
 ## Not yet verified on hardware
 
-The sequence/PLC/jitter path in this revision has been compiled, not
-air-tested. Please open an issue with the serial counters if it misbehaves.
+Both builds compile; neither this revision's sequence/PLC/jitter path nor the
+ESP-IDF port has been air-tested. Please open an issue with the serial
+counters if it misbehaves.
 
 ## Heap use in the hot path: none
 

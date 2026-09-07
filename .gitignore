@@ -9,3 +9,9 @@ LINEAGE.md
 lib/Arduino_DriveBus/
 .pio/
 .vscode/
+/components/codec2/upstream/
+/managed_components/
+/dependencies.lock
+/build/
+/sdkconfig
+/sdkconfig.old
